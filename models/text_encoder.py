@@ -75,8 +75,8 @@ if __name__ == '__main__':
     )
 
     B = 1
-    T = 100
-    x = torch.randint(0, len(config['symbols']), (B, T))  # [B, T], 随机生成一个文本序列，长度为100
+    T = 10
+    x = torch.randint(0, len(config['symbols']), (B, T))  # [B, T], 随机生成一个文本序列
     assert x.shape == (B, T)
     x_lengths = torch.tensor([T])
     x, m, logs, x_mask = text_encoder(x, x_lengths)
@@ -84,3 +84,4 @@ if __name__ == '__main__':
     assert m.shape == (B, config['model']['inter_channels'], T)
     assert logs.shape == (B, config['model']['inter_channels'], T)
     assert x_mask.shape == (B, 1, T)
+    print("All tests passed.")

@@ -121,6 +121,7 @@ class MultiHeadAttention(nn.Module):
     self.conv_o = nn.Conv1d(channels, out_channels, 1)
     self.drop = nn.Dropout(p_dropout)
 
+    # 窗口注意力，K=4（默认）
     if window_size is not None:
       n_heads_rel = 1 if heads_share else n_heads
       rel_stddev = self.k_channels**-0.5
@@ -130,35 +131,39 @@ class MultiHeadAttention(nn.Module):
     nn.init.xavier_uniform_(self.conv_q.weight)
     nn.init.xavier_uniform_(self.conv_k.weight)
     nn.init.xavier_uniform_(self.conv_v.weight)
+
     if proximal_init:
       with torch.no_grad():
         self.conv_k.weight.copy_(self.conv_q.weight)
         self.conv_k.bias.copy_(self.conv_q.bias)
       
   def forward(self, x, c, attn_mask=None):
-    q = self.conv_q(x)
-    k = self.conv_k(c)
-    v = self.conv_v(c)
+    q = self.conv_q(x)  # -> [b, d, t_s]
+    k = self.conv_k(c)  # -> [b, d, t_t]
+    v = self.conv_v(c)  # -> [b, d, t_t]
     
     x, self.attn = self.attention(q, k, v, mask=attn_mask)
 
-    x = self.conv_o(x)
+    x = self.conv_o(x) 
     return x
 
   def attention(self, query, key, value, mask=None):
     # reshape [b, d, t] -> [b, n_h, t, d_k]
     b, d, t_s, t_t = (*key.size(), query.size(2))
-    query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
-    key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
-    value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
+    query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)   # [b, n_h, t_t, d_k]
+    key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)       # [b, n_h, t_s, d_k]
+    value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)   # [b, n_h, t_s, d_k]
 
-    scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
+    scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))  # [b, n_h, t_t, t_s]
+
+    # 窗口注意力，K=4（默认）
     if self.window_size is not None:
       assert t_s == t_t, "Relative attention is only available for self-attention."
-      key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
-      rel_logits = self._matmul_with_relative_keys(query /math.sqrt(self.k_channels), key_relative_embeddings)
-      scores_local = self._relative_position_to_absolute_position(rel_logits)
+      key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)  # [n_h, t_s, d_k]
+      rel_logits = self._matmul_with_relative_keys(query /math.sqrt(self.k_channels), key_relative_embeddings)  # [b, n_h, t_t, t_s]
+      scores_local = self._relative_position_to_absolute_position(rel_logits)  # [b, n_h, t_t, t_s]
       scores = scores + scores_local
+    
     if self.proximal_bias:
       assert t_s == t_t, "Proximal bias is only available for self-attention."
       scores = scores + self._attention_bias_proximal(t_s).to(device=scores.device, dtype=scores.dtype)
@@ -168,9 +173,11 @@ class MultiHeadAttention(nn.Module):
         assert t_s == t_t, "Local attention is only available for self-attention."
         block_mask = torch.ones_like(scores).triu(-self.block_length).tril(self.block_length)
         scores = scores.masked_fill(block_mask == 0, -1e4)
+    
     p_attn = F.softmax(scores, dim=-1) # [b, n_h, t_t, t_s]
+    
     p_attn = self.drop(p_attn)
-    output = torch.matmul(p_attn, value)
+    output = torch.matmul(p_attn, value)  # [b, n_h, t_t, d_k]
     if self.window_size is not None:
       relative_weights = self._absolute_position_to_relative_position(p_attn)
       value_relative_embeddings = self._get_relative_embeddings(self.emb_rel_v, t_s)
@@ -197,18 +204,28 @@ class MultiHeadAttention(nn.Module):
     return ret
 
   def _get_relative_embeddings(self, relative_embeddings, length):
-    max_relative_position = 2 * self.window_size + 1
+    """
+    relative_embeddings: [n_h, max_relative_position, d_k]
+    length: 输入序列长度
+    序列长度为length时，可能的相对位置差为-L到L，共2*L+1个位置。此外，有窗口的限制，窗口之外的相对位置权重为0。
+    """
+    max_relative_position = 2 * self.window_size + 1  # 窗口大小（向左向右各扩展window_size）
     # Pad first before slice to avoid using cond ops.
-    pad_length = max(length - (self.window_size + 1), 0)
-    slice_start_position = max((self.window_size + 1) - length, 0)
-    slice_end_position = slice_start_position + 2 * length - 1
+    pad_length = max(length - (self.window_size + 1), 0)  # padding长度
+    slice_start_position = max((self.window_size + 1) - length, 0)  # 切片开始位置
+    slice_end_position = slice_start_position + 2 * length - 1  # 切片结束位置
+    
+
     if pad_length > 0:
+      # 序列长度大于窗口大小，需要padding
       padded_relative_embeddings = F.pad(
           relative_embeddings,
-          commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]))
+          commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]))  # [n_h, 2*length - 1, d_k]
     else:
+      # 序列长度小于等于窗口大小，不需要padding
       padded_relative_embeddings = relative_embeddings
-    used_relative_embeddings = padded_relative_embeddings[:,slice_start_position:slice_end_position]
+    
+    used_relative_embeddings = padded_relative_embeddings[:,slice_start_position:slice_end_position]  # [n_h, 2*length - 1, d_k]
     return used_relative_embeddings
 
   def _relative_position_to_absolute_position(self, x):

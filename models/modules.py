@@ -18,4 +18,4 @@ class LayerNorm(nn.Module):
         x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
         x = x.transpose(1, -1)
         # [B, 192, T]
-        return x
+        return 

@@ -24,3 +24,26 @@ def convert_pad_shape(pad_shape: List[List[int]]):
     l = pad_shape[::-1]
     pad_shape = [item for sublist in l for item in sublist]
     return pad_shape
+
+
+def fused_add_tanh_sigmoid_multiply(
+    input_a,
+    input_b,
+    n_channels_tensor,
+):
+    """
+    融合了add、tanh、sigmoid和multiply操作的函数。
+    输入：
+        input_a: [B, 2*C, T]
+        input_b: [B, 2*C, T]
+        n_channels_tensor: [1] 隐藏层通道数
+    输出：
+        output: [B, C, T]
+    """
+    n_channels = n_channels_tensor.item()
+    in_act = input_a + input_b
+    # split into two parts
+    t_act = torch.tanh(in_act[:, :n_channels, :])
+    s_act = torch.sigmoid(in_act[:, n_channels:, :])
+    act = t_act * s_act
+    return act
