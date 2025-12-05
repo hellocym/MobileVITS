@@ -2,6 +2,24 @@ from typing import List
 
 import torch
 
+def init_weights(m, mean=0.0, std=0.01):
+    """
+    初始化卷积层的权重为正态分布
+    mean: 正态分布的均值
+    std: 正态分布的标准差
+    """
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        m.weight.data.normal_(mean, std)
+
+def get_padding(kernel_size: int, dilation: int = 1):
+    """
+    计算卷积层的padding大小，确保输出与输入长度相同
+    kernel_size: 卷积核大小
+    dilation: 膨胀系数
+    """
+    return int((kernel_size * dilation - dilation) / 2)
+
 def sequence_mask(lengths, max_len=None):
     """
     生成一个形状为[B, T]的mask矩阵，其中小于等于文本长度的位置为True，其他位置为False
