@@ -1,10 +1,14 @@
+import math
+
 import torch
 from torch import nn
 from torch.nn import Conv1d, functional as F
-from torch.nn.utils import weight_norm, remove_weight_norm
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import remove_weight_norm
 
 from commons import init_weights, get_padding
 from wavenet import WN
+from transforms import piecewise_rational_quadratic_transform
 
 LRELU_SLOPE = 0.1
 
@@ -26,6 +30,16 @@ class LayerNorm(nn.Module):
         # [B, 192, T]
         return x
 
+class LogFlow(nn.Module):
+    def forward(self, x, x_mask, reverse=False, **kwargs):
+        if not reverse:
+            y = torch.log(torch.clamp_min(x, 1e-5)) * x_mask
+            logdet = torch.sum(-y, [1, 2])
+            return y, logdet
+        else:
+            x = torch.exp(x) * x_mask
+            return x
+
 class Flip(nn.Module):
     def forward(self, x, *args, reverse=False, **kwargs):
         x = torch.flip(x, [1])
@@ -34,7 +48,27 @@ class Flip(nn.Module):
             return x, logdet
         else:
             return x
-        
+
+class ElementwiseAffine(nn.Module):
+    """
+    将输入的每个通道进行仿射变换，即 y = x * exp(logs) + m
+    """
+    def __init__(self, channels=2):
+        super().__init__()
+        self.channels = channels
+        self.logs = nn.Parameter(torch.zeros(channels, 1))
+        self.m = nn.Parameter(torch.zeros(channels, 1))
+
+    def forward(self, x, x_mask, reverse=False, **kwargs):
+        # x: [B, 2, T]
+        if not reverse:
+            y = self.m + torch.exp(self.logs) * x
+            y = y * x_mask
+            logdet = torch.sum(self.logs * x_mask, [1, 2])
+            return y, logdet
+        else:
+            x = (x - self.m) * torch.exp(-self.logs) * x_mask
+            return x
 
 class ResiduleCouplingLayer(nn.Module):
     def __init__(self,
@@ -96,6 +130,46 @@ class ResiduleCouplingLayer(nn.Module):
             x1 = (x1 - m) * torch.exp(-logs) * x_mask   # [B, 96, T]
             x = torch.cat([x0, x1], 1)  # [B, 192, T]
             return x
+
+class DDSConv(nn.Module):
+  """
+  Dialted and Depth-Separable Convolution
+  """
+  def __init__(self, channels, kernel_size, n_layers, p_dropout=0.):
+    super().__init__()
+    self.channels = channels
+    self.kernel_size = kernel_size
+    self.n_layers = n_layers
+    self.p_dropout = p_dropout
+
+    self.drop = nn.Dropout(p_dropout)
+    self.convs_sep = nn.ModuleList()
+    self.convs_1x1 = nn.ModuleList()
+    self.norms_1 = nn.ModuleList()
+    self.norms_2 = nn.ModuleList()
+    for i in range(n_layers):
+      dilation = kernel_size ** i
+      padding = (kernel_size * dilation - dilation) // 2
+      self.convs_sep.append(nn.Conv1d(channels, channels, kernel_size, 
+          groups=channels, dilation=dilation, padding=padding
+      ))
+      self.convs_1x1.append(nn.Conv1d(channels, channels, 1))
+      self.norms_1.append(LayerNorm(channels))
+      self.norms_2.append(LayerNorm(channels))
+
+  def forward(self, x, x_mask, g=None):
+    if g is not None:
+      x = x + g
+    for i in range(self.n_layers):
+      y = self.convs_sep[i](x * x_mask)
+      y = self.norms_1[i](y)
+      y = F.gelu(y)
+      y = self.convs_1x1[i](y)
+      y = self.norms_2[i](y)
+      y = F.gelu(y)
+      y = self.drop(y)
+      x = x + y
+    return x * x_mask
 
 class ResBlock1(nn.Module):
     def __init__(self,
@@ -168,3 +242,49 @@ class ResBlock2(nn.Module):
     def remove_weight_norm(self):
         for l in self.convs:
             remove_weight_norm(l)
+
+class ConvFlow(nn.Module):
+  def __init__(self, in_channels, filter_channels, kernel_size, n_layers, num_bins=10, tail_bound=5.0):
+    super().__init__()
+    self.in_channels = in_channels
+    self.filter_channels = filter_channels
+    self.kernel_size = kernel_size
+    self.n_layers = n_layers
+    self.num_bins = num_bins
+    self.tail_bound = tail_bound
+    self.half_channels = in_channels // 2
+
+    self.pre = nn.Conv1d(self.half_channels, filter_channels, 1)
+    self.convs = DDSConv(filter_channels, kernel_size, n_layers, p_dropout=0.)
+    self.proj = nn.Conv1d(filter_channels, self.half_channels * (num_bins * 3 - 1), 1)
+    self.proj.weight.data.zero_()
+    self.proj.bias.data.zero_()
+
+  def forward(self, x, x_mask, g=None, reverse=False):
+    x0, x1 = torch.split(x, [self.half_channels]*2, 1)
+    h = self.pre(x0)
+    h = self.convs(h, x_mask, g=g)
+    h = self.proj(h) * x_mask
+
+    b, c, t = x0.shape
+    h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2) # [b, cx?, t] -> [b, c, t, ?]
+
+    unnormalized_widths = h[..., :self.num_bins] / math.sqrt(self.filter_channels)
+    unnormalized_heights = h[..., self.num_bins:2*self.num_bins] / math.sqrt(self.filter_channels)
+    unnormalized_derivatives = h[..., 2 * self.num_bins:]
+
+    x1, logabsdet = piecewise_rational_quadratic_transform(x1,
+        unnormalized_widths,
+        unnormalized_heights,
+        unnormalized_derivatives,
+        inverse=reverse,
+        tails='linear',
+        tail_bound=self.tail_bound
+    )
+
+    x = torch.cat([x0, x1], 1) * x_mask
+    logdet = torch.sum(logabsdet * x_mask, [1,2])
+    if not reverse:
+        return x, logdet
+    else:
+        return x
